@@ -9,12 +9,14 @@ The analysis answers two separate questions:
    when the winning lag is an interior peak, |r| clears a high floor, it beats
    lag 0 and the next separated lobe by a margin, and enough jointly-active
    audio exists.  Otherwise the tool offers the direct downmix only.
-2. *Where does the direct downmix lose energy?*  Per 20 ms frame with both
-   channels active, the direct average is compared with the best coherent
-   energy.  A sustained loss plus a negative aligned channel correlation marks
-   suspected anti-phase.  Frames with silence or a single active side never
-   qualify.  Detection only runs once a delay is confirmed: without alignment
-   the cancellation measurement is meaningless, and the contract then offers
+2. *Where does the direct downmix lose energy?*  On the recording's own time
+   axis, in 10 ms units.  A unit qualifies only when both channels are active
+   in that unit, the *in-place* left/right average (not an aligned average)
+   loses at least 5 dB relative to the coherent energy, and the aligned
+   short-time correlation is anti-phase.  Units failing the in-place test break
+   a region even where analysis windows overlap or a short gap could otherwise
+   be closed.  Detection only runs once a delay is confirmed: without
+   alignment the anti-phase test is meaningless, and the contract then offers
    the direct downmix alone.
 
 Repair works on merged selections only.  The base buffer is always exactly
@@ -38,12 +40,12 @@ MAX_SAMPLES = SAMPLE_RATE * MAX_SECONDS
 MAX_LAG_MS = 2.0            # contractual assumption
 SEARCH_LAG_MS = 4.0         # search range; peaks beyond MAX_LAG_MS are rejected
 
-FRAME_MS = 20
-HOP_MS = 10
+FRAME_MS = 20              # correlation analysis window
+HOP_MS = 10                # analysis hop == the 10 ms unit that defines a span
 MIN_RMS_DBFS = -50.0        # below this a channel counts as silent
-SILENCE_GAP_BLOCKS = 2      # close detection gaps up to ~20 ms
+SILENCE_GAP_BLOCKS = 2      # delay estimate only: ignore <=20 ms dropouts
 MIN_REGION_MS = 80
-MIN_LOSS_DB = 5.0           # downmix energy loss vs. the coherent sum
+MIN_LOSS_DB = 5.0           # in-place downmix energy loss vs. the coherent sum
 MIN_CORR = 0.45             # aligned channels must be anti-correlated this strongly
 CORR_CONFIRM = 0.80         # |r| needed to confirm a constant delay
 CORR_DOMINANCE = 0.10       # margin over lag 0 / next lobe
@@ -307,96 +309,101 @@ def _make_region(start: int, end: int, loss: float, corr: float, rate: int) -> d
 def detect_regions(left: np.ndarray, right: np.ndarray, delay: int, rate: int = SAMPLE_RATE) -> list[dict]:
     """Find intervals where the direct downmix cancels energy.
 
-    ``delay`` is the right channel's lag in samples (positive: right is late)
-    and is applied before comparing the channels.  Frames where either channel
-    is silent are never candidates, so silence and single-sided audio are never
-    flagged.
+    Suspected intervals are expressed on the recording's own time axis and are
+    built from whole 10 ms units (``HOP_MS``), i.e. unit ``u`` covers
+    ``[u*hop, (u+1)*hop)``.  ``delay`` only affects the short-time correlation
+    used as the anti-phase test; it never changes which samples are averaged
+    for the energy-loss test.
 
-    Two independent pieces of evidence must agree: the direct average loses at
-    least ``MIN_LOSS_DB`` relative to the best coherent energy, and the aligned
-    channels are anti-correlated by at least ``MIN_CORR``.
+    A unit is selected only if all of the following hold:
+
+    * both channels are audible inside that unit (``MIN_RMS_DBFS``);
+    * the *in-place* left/right average ``(L+R)/2`` loses at least
+      ``MIN_LOSS_DB`` relative to the coherent energy ``(|L|^2+|R|^2)/4``;
+    * the delay-aligned 20 ms correlation at that unit is at most
+      ``-MIN_CORR``.
+
+    Selected units are grouped into runs with no gap closing and no bridging of
+    failing units.  If any unit between two otherwise qualifying units fails —
+    e.g. one side is briefly silent, or the in-place average no longer loses
+    energy — the region is split there.  Runs shorter than ``MIN_REGION_MS``
+    are discarded.
     """
     n = min(len(left), len(right))
-    frame = max(1, int(round(rate * FRAME_MS / 1000)))
     hop = max(1, int(round(rate * HOP_MS / 1000)))
-    db_l = _frame_rms_db(left[:n], frame, hop)
-    db_r = _frame_rms_db(right[:n], frame, hop)
-    active_l = _smooth_mask(db_l > MIN_RMS_DBFS, SILENCE_GAP_BLOCKS)
-    active_r = _smooth_mask(db_r > MIN_RMS_DBFS, SILENCE_GAP_BLOCKS)
-    joint = active_l & active_r
+    frame = max(1, int(round(rate * FRAME_MS / 1000)))
+    n_units = n // hop
 
-    n_frames = len(db_l)
-    loss_db = np.full(n_frames, np.nan)
-    corr = np.full(n_frames, np.nan)
-    valid = np.zeros(n_frames, dtype=bool)
-    for i in range(n_frames):
-        s = i * hop
-        ls, le = s + max(0, -delay), s + max(0, -delay) + frame
-        rs, re = s + max(0, delay), s + max(0, delay) + frame
-        if le > n or re > n:
+    loss_db = np.full(n_units, np.nan)
+    corr = np.full(n_units, np.nan)
+    selected = np.zeros(n_units, dtype=bool)
+
+    for u in range(n_units):
+        s = u * hop
+        e = s + hop
+        if e > n:
+            break
+        # Both channels must be active on the recording's own time axis.
+        a_unit = left[s:e].astype(np.float64)
+        b_unit = right[s:e].astype(np.float64)
+        rms_l = float(np.sqrt(np.mean(a_unit * a_unit)))
+        rms_r = float(np.sqrt(np.mean(b_unit * b_unit)))
+        if rms_l <= 10.0 ** (MIN_RMS_DBFS / 20.0) or rms_r <= 10.0 ** (MIN_RMS_DBFS / 20.0):
             continue
-        if not joint[i]:
-            continue
-        a = left[ls:le].astype(np.float64)
-        b = right[rs:re].astype(np.float64)
-        a2 = float(np.dot(a, a))
-        b2 = float(np.dot(b, b))
+
+        # In-place downmix loss: sample-for-sample average, no alignment.
+        a2 = float(np.dot(a_unit, a_unit))
+        b2 = float(np.dot(b_unit, b_unit))
         if a2 <= 1e-12 or b2 <= 1e-12:
             continue
-        dm = 0.5 * (a + b)
+        dm = 0.5 * (a_unit + b_unit)
         direct = float(np.dot(dm, dm))
         best = 0.25 * (a2 + b2)
-        loss_db[i] = 60.0 if direct <= 1e-12 else min(60.0, 10.0 * np.log10(best / direct))
-        corr[i] = float(np.dot(a, b) / np.sqrt(a2 * b2))
-        valid[i] = True
+        loss = 60.0 if direct <= 1e-12 else min(60.0, 10.0 * np.log10(best / direct))
 
-    flagged = valid & (loss_db >= MIN_LOSS_DB) & (corr <= -MIN_CORR)
-    flagged = _smooth_mask(flagged, SILENCE_GAP_BLOCKS)
-
-    min_frames = max(1, int(round(MIN_REGION_MS / HOP_MS)))
-    regions: list[dict] = []
-    for a, b in _segments(flagged):
-        if b - a + 1 < min_frames:
+        # Anti-phase test: the aligned 20 ms short-time correlation, unchanged
+        # in window length and threshold.  The window may overlap a neighbour,
+        # but it is evaluated per 10 ms unit; a unit where it fails is simply
+        # not selected and breaks the region.
+        ls = s + max(0, -delay)
+        rs = s + max(0, delay)
+        if ls + frame > n or rs + frame > n:
             continue
-        # A candidate must stay jointly active for its whole span.  If one side
-        # drops out, keep only the largest jointly-active sub-run.
-        span = joint[a : b + 1]
-        if span.all():
-            runs = [(a, b)]
-        else:
-            runs = [(a + x, a + y) for x, y in _segments(span)]
-        for x, y in runs:
-            if y - x + 1 < min_frames:
-                continue
-            # The region is expressed on the file's own (left-channel) time
-            # axis; alignment only shifts which samples are compared.
-            start = min(n, x * hop)
-            end = min(n, y * hop + frame)
-            if end <= start:
-                continue
-            regions.append(
-                _make_region(
-                    start,
-                    end,
-                    float(np.nanmean(loss_db[x : y + 1])),
-                    float(np.nanmean(corr[x : y + 1])),
-                    rate,
-                )
-            )
+        a = left[ls : ls + frame].astype(np.float64)
+        b = right[rs : rs + frame].astype(np.float64)
+        a2w = float(np.dot(a, a))
+        b2w = float(np.dot(b, b))
+        if a2w <= 1e-12 or b2w <= 1e-12:
+            continue
+        c = float(np.dot(a, b) / np.sqrt(a2w * b2w))
 
-    regions.sort(key=lambda r: r["start_sample"])
-    merged: list[dict] = []
-    for r in regions:
-        if merged and r["start_sample"] <= merged[-1]["end_sample"]:
-            last = merged[-1]
-            last["end_sample"] = max(last["end_sample"], r["end_sample"])
-            last["end_ms"] = _ms(last["end_sample"], rate)
-            last["duration_ms"] = _ms(last["end_sample"] - last["start_sample"], rate)
-            last["loss_db"] = round(max(last["loss_db"], r["loss_db"]), 2)
-            last["correlation"] = round(min(last["correlation"], r["correlation"]), 3)
-        else:
-            merged.append(dict(r))
-    return merged
+        loss_db[u] = loss
+        corr[u] = c
+        selected[u] = loss >= MIN_LOSS_DB and c <= -MIN_CORR
+
+    # Contiguous selected units form one region.  There is deliberately no
+    # gap-closing pass and no merging across unselected units: overlapping
+    # analysis windows must not re-bridge a unit that failed the in-place test.
+    min_units = max(1, int(np.ceil(MIN_REGION_MS / HOP_MS)))
+    regions: list[dict] = []
+    for a_u, b_u in _segments(selected):
+        count = b_u - a_u + 1
+        if count < min_units:
+            continue
+        start = a_u * hop
+        end = min(n, (b_u + 1) * hop)
+        if end <= start:
+            continue
+        regions.append(
+            _make_region(
+                start,
+                end,
+                float(np.mean(loss_db[a_u : b_u + 1])),
+                float(np.mean(corr[a_u : b_u + 1])),
+                rate,
+            )
+        )
+    return regions
 
 
 def waveform_peaks(mono: np.ndarray, bins: int = 1400) -> list[list[float]]:

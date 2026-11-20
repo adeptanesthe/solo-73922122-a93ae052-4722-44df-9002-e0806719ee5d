@@ -212,6 +212,10 @@
     return span;
   }
 
+  function sameSpan(s, r) {
+    return s.start === r.start_sample && s.end === r.end_sample;
+  }
+
   // ---------- pointer editing ----------
   canvas.addEventListener("pointerdown", (ev) => {
     if (!state.total || !state.analysis?.delay_confirmed) return;
@@ -296,9 +300,7 @@
 
   // ---------- selections ----------
   function toggleRegion(r) {
-    const existing = state.spans.find(
-      (s) => Math.abs(s.start - r.start_sample) <= 1 && Math.abs(s.end - r.end_sample) <= 1
-    );
+    const existing = state.spans.find((s) => sameSpan(s, r));
     if (existing) {
       state.spans = state.spans.filter((s) => s !== existing);
     } else {
@@ -528,9 +530,7 @@
 
   $("#select-suspects").addEventListener("click", () => {
     for (const r of state.analysis?.regions || []) {
-      const exists = state.spans.some(
-        (s) => Math.abs(s.start - r.start_sample) <= 1 && Math.abs(s.end - r.end_sample) <= 1
-      );
+      const exists = state.spans.some((s) => sameSpan(s, r));
       if (!exists) addSpan(r.start_sample, r.end_sample, "suspect");
     }
     syncFromSpans();

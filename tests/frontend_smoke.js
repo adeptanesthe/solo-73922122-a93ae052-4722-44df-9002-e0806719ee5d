@@ -191,10 +191,50 @@ const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
   check("reset hides panels", $("#result-panel").hidden && $("#editor-panel").hidden);
   check("reset clears status", $("#status").textContent.includes("等待上传"));
 
-  // unconfirmed-delay path
-  const html2 = document.querySelector("#result-panel");
-  const resp = await window.fetch("/api/analyze"); // sanity: mock reachable
-  check("fetch mock reachable", resp.ok);
+  // ---- second scenario: unit-aligned regions split by a one-sided gap ----
+  ANALYSIS.regions = [
+    { start_sample: 22400, end_sample: 28800, start_ms: 1400, end_ms: 1800, duration_ms: 400, loss_db: 6.2, correlation: -1 },
+    { start_sample: 29120, end_sample: 39840, start_ms: 1820, end_ms: 2490, duration_ms: 670, loss_db: 6.1, correlation: -1 },
+    { start_sample: 57600, end_sample: 71040, start_ms: 3600, end_ms: 4440, duration_ms: 840, loss_db: 6.3, correlation: -1 },
+  ];
+  fire($("#file-input"), "change");
+  $("#analyze-btn").click();
+  await tick(20);
+  check("three unit regions reported", $("#facts").textContent.includes("3 段"),
+    $("#facts").textContent);
+  $("#select-suspects").click();
+  check("select all keeps the gap split", document.querySelectorAll(".sel-row").length === 3,
+    `rows=${document.querySelectorAll(".sel-row").length}`);
+  $("#render-btn").click();
+  await tick(20);
+  const splitCall = calls.filter((c) => c.url.endsWith("/render")).pop();
+  const splitSpans = JSON.parse(splitCall.opts.body).spans;
+  check("suspect spans are exactly the unit regions", JSON.stringify(splitSpans) === JSON.stringify([
+    { start_sample: 22400, end_sample: 28800 },
+    { start_sample: 29120, end_sample: 39840 },
+    { start_sample: 57600, end_sample: 71040 },
+  ]), JSON.stringify(splitSpans));
+
+  // ---- third scenario: unconfirmed delay offers the downmix only ----
+  $("#reset-btn").click();
+  ANALYSIS.delay_confirmed = false;
+  ANALYSIS.delay_samples = null;
+  ANALYSIS.delay_ms = null;
+  ANALYSIS.delay_reason = "相关峰与零时差/次峰的差异不足，无法确认固定时差。";
+  ANALYSIS.regions = [];
+  fire($("#file-input"), "change");
+  $("#analyze-btn").click();
+  await tick(20);
+  check("unconfirmed disables suspect select", $("#select-suspects").disabled);
+  check("unconfirmed disables clear", $("#clear-selection").disabled);
+  check("unconfirmed reason shown", $("#notes").textContent.includes("无法确认固定时差"));
+  $("#render-btn").click();
+  await tick(20);
+  const downCall = calls.filter((c) => c.url.endsWith("/render")).pop();
+  check("unconfirmed posts no spans", JSON.parse(downCall.opts.body).spans.length === 0);
+  check("unconfirmed result is downmix", $("#status").textContent.includes("仅输出直接下混"),
+    $("#status").textContent);
+  check("unconfirmed download is downmix", $("#download-link").getAttribute("download") === "downmix-mono.wav");
 
   let failed = 0;
   for (const r of results) {

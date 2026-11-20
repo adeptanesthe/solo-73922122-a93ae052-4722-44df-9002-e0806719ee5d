@@ -33,8 +33,23 @@ def source(seconds=4.0, seed=5):
     return (x * (0.55 + 0.45 * np.sin(2 * np.pi * 1.7 * t) ** 2)).astype(np.float32)
 
 
-def scenario(d=24, invert=True, seconds=4.0):
-    x = source(seconds)
+def voiced(seconds=4.0, seed=11, f0=200.0, noise=0.05):
+    """Periodic pseudo-voice: in-place cancellation is real at 1 ms delay."""
+    n = int(RATE * seconds)
+    t = np.arange(n) / RATE
+    rng = np.random.default_rng(seed)
+    x = (
+        0.85 * np.sin(2 * np.pi * f0 * t)
+        + 0.22 * np.sin(2 * np.pi * 2 * f0 * t + 0.4)
+        + 0.08 * np.sin(2 * np.pi * 3 * f0 * t + 1.1)
+    )
+    x = x + noise * rng.standard_normal(n)
+    x = x * (0.72 + 0.28 * np.sin(2 * np.pi * 2.1 * t) ** 2)
+    return (x / np.max(np.abs(x)) * 0.55).astype(np.float32)
+
+
+def scenario(d=8, invert=True, seconds=4.0):
+    x = voiced(seconds)
     r = np.zeros_like(x)
     r[d:] = x[: len(x) - d]
     if invert:
@@ -79,10 +94,12 @@ def test_analyze_returns_metadata_and_waveform(client):
     body = analyze(client, scenario())
     a = body["analysis"]
     assert a["delay_confirmed"] is True
-    assert a["delay_samples"] == 24
+    assert a["delay_samples"] == 8
     assert a["samples"] == RATE * 4
     assert len(a["regions"]) == 1
     assert 19000 <= a["regions"][0]["start_sample"] <= 20320
+    assert a["regions"][0]["start_sample"] % 160 == 0
+    assert a["regions"][0]["end_sample"] % 160 == 0
     assert len(body["waveform"]) > 100
     assert body["downmix_url"].endswith("/downmix.wav")
     assert body["original_url"].endswith("/original.wav")
@@ -123,15 +140,64 @@ def test_render_repairs_and_preserves_length(client):
     frames, pcm = decode(resp.content)
     assert frames == n
 
-    # outside must equal the direct downmix (within 1 LSB of encoding)
+    # outside the selected spans must equal the direct downmix sample-for-sample
     dm = client.get(body["downmix_url"])
     assert dm.status_code == 200
     dm_frames, dm_pcm = decode(dm.content)
     assert dm_frames == n
     mask = np.ones(n, dtype=bool)
     for s in spans:
-        mask[s["start_sample"] : s["end_sample"] + 1] = False
-    assert np.max(np.abs(pcm[mask].astype(int) - dm_pcm[mask].astype(int))) <= 1
+        # spans are half-open [start_sample, end_sample)
+        mask[s["start_sample"] : s["end_sample"]] = False
+    assert mask.any()
+    assert np.array_equal(pcm[mask], dm_pcm[mask])
+
+
+def test_select_all_regions_leaves_every_unselected_unit_bit_exact(client):
+    """Contract: after 'select all suspects', every unit not in a region equals
+    the direct downmix sample-for-sample, and regions cover only whole units."""
+    x = voiced(5.0)
+    d = 8
+    r = np.zeros_like(x)
+    r[d:] = x[: len(x) - d]
+    r[RATE : 2 * RATE] *= -1
+    left = x.copy()
+    left[int(RATE * 1.5) : int(RATE * 1.5) + 160] = 0.0  # one-sided unit in the middle
+    body = analyze(client, make_wav(left, r))
+    a = body["analysis"]
+    assert a["delay_confirmed"] is True
+    regions = a["regions"]
+    assert len(regions) == 2, regions
+    for reg in regions:
+        assert reg["start_sample"] % 160 == 0
+        assert reg["end_sample"] % 160 == 0
+
+    # the one-sided unit must not be inside any region
+    a0, a1 = int(RATE * 1.5), int(RATE * 1.5) + 160
+    assert all(not (reg["start_sample"] < a1 and a0 < reg["end_sample"]) for reg in regions)
+
+    job = body["job_id"]
+    resp = client.post(
+        f"/api/jobs/{job}/render",
+        json={"spans": [{"start_sample": g["start_sample"], "end_sample": g["end_sample"]} for g in regions]},
+    )
+    assert resp.headers["X-Result-Mode"] == "repaired"
+    frames, pcm = decode(resp.content)
+    assert frames == len(x)
+    _, dm_pcm = decode(client.get(body["downmix_url"]).content)
+
+    unit = 160
+    n_units = len(x) // unit
+    inside = np.zeros(n_units, dtype=bool)
+    for reg in regions:
+        inside[reg["start_sample"] // unit : reg["end_sample"] // unit] = True
+    assert not inside[a0 // unit]  # the one-sided unit is excluded
+    for u in np.flatnonzero(~inside):
+        s = u * unit
+        assert np.array_equal(pcm[s : s + unit], dm_pcm[s : s + unit]), f"unit {s} changed"
+    # tail samples after the last whole unit are untouched too
+    tail = n_units * unit
+    assert np.array_equal(pcm[tail:], dm_pcm[tail:])
 
 
 def test_render_without_spans_is_downmix(client):
